@@ -11,7 +11,7 @@ export class CDPJwtUtils {
     apiKeyId: string, 
     apiSecret: string, 
     requestMethod: string = 'POST',
-    requestPath: string = '/v2/x402/verify'
+    requestPath: string = '/platform/v2/x402/verify'
   ): Promise<string> {
     console.log('🔐 CDP SDK JWT Generation started');
     console.log('🔑 API Key ID length:', apiKeyId?.length);

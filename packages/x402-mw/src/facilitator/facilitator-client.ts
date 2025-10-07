@@ -56,7 +56,7 @@ export class FacilitatorClient {
       
       console.log('🔍 Facilitator API Debug - CDP SDK使用:');
       console.log('📍 Base URL:', this.axiosInstance.defaults.baseURL);
-      console.log('🔗 Full URL:', `${this.axiosInstance.defaults.baseURL}/v2/x402/verify`);
+      console.log('🔗 Full URL:', `${this.axiosInstance.defaults.baseURL}/platform/v2/x402/verify`);
       console.log('🔑 Generated JWT preview:', jwtToken.substring(0, 50) + '...');
       
       // リクエストペイロードの確認
@@ -68,7 +68,7 @@ export class FacilitatorClient {
         amount: request.requirements.maxAmountRequired,
       });
 
-      const response = await this.axiosInstance.post<VerifyResponse>('/v2/x402/verify', request, {
+      const response = await this.axiosInstance.post<VerifyResponse>('/platform/v2/x402/verify', request, {
         headers: {
           'Authorization': `Bearer ${jwtToken}`,
         }
