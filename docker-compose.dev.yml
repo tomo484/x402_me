@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database (開発用)
+  postgres:
+    image: postgres:15-alpine
+    container_name: x402-postgres-dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: x402_middleware
+      POSTGRES_USER: x402_user
+      POSTGRES_PASSWORD: x402_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U x402_user -d x402_middleware"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - x402-dev-network
+
+  # Redis Cache (開発用)
+  redis:
+    image: redis:7-alpine
+    container_name: x402-redis-dev
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass x402_redis_password
+    volumes:
+      - redis_dev_data:/data
+      - ./infra/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - x402-dev-network
+
+  # Adminer (Database Management Tool)
+  adminer:
+    image: adminer:4.8.1
+    container_name: x402-adminer-dev
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+    networks:
+      - x402-dev-network
+
+volumes:
+  postgres_dev_data:
+    driver: local
+  redis_dev_data:
+    driver: local
+
+networks:
+  x402-dev-network:
+    driver: bridge 

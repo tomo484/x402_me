@@ -1,0 +1,112 @@
+##MVPの機能スコープ（何ができるか）
+-x402ペイウォール：有料エンドポイントにアクセスが来たらHTTP 402で支払い要件を返す／支払い証跡付きで再送されたら検証→200 OKで返す。X-PAYMENT と X-PAYMENT-RESPONSE を使う基本フロー。
+-支払い検証：まずは CDPのx402 Facilitator（REST API）へ POST /v2/x402/verify → POST /v2/x402/settle の順で連携（自前検証モードにも後で切替可能）。
+-レート制限：IP／ウォレットアドレス単位のスライディングウィンドウ（Redis）。
+-リプレイ防止：nonce＋有効期限を支払いにバインドし、同一nonceの再利用を拒否。
+-ログ → 会計エクスポート：決済監査ログ（誰が／いつ／どのURL／いくら／txハッシュ）をPostgresへ。CSVエクスポート（期間・通貨・円換算など）。
+-ウォレットUX（付加価値）：Smart Wallet＆Paymasterとつなげればガスレス体験（買い手がETH不要）。まずはテストネットで実感→本番へ。
+-ネットワーク／トークン：当面は Base / USDC。x402はEIP-3009（transferWithAuthorization）対応トークン必須が前提。
+-CDPホスト型FacilitatorはBaseのUSDCで手数料無料運用（現行案内）。 
+
+##技術構成（TypeScriptフルスタック）
+モノレポ構成（例）
+/apps
+  /api        # Express/Nest（x402ミドルウェア実装） 
+  /web        # Next.js（デモUI, Smart Wallet連携）
+/packages
+  /x402-mw    # 402応答/検証/リプレイ防止/レート制限の共通ミドルウェア
+  /shared     # 型（PaymentRequirements, PaymentPayload など）
+/infra
+  docker-compose.yml  # Postgres, Redis, api, web
+
+主要ライブラリ
+-Server：Node.js + Express（またはNest）／viem（自前検証時）
+-x402：独自ミドルウェア（packages/x402-mw）で402応答生成→検証→解放を共通化
+-DB/Cache：PostgreSQL（Prisma/Drizzle）＋ Redis（ioredis）
+-Wallet：Coinbase Smart Wallet SDK（任意）
+-Observability：OpenTelemetry／Sentry／Prometheus
+
+##リクエスト〜決済〜解放の設計
+3.1 シーケンス（MVP）
+1.クライアントが有料APIへHTTPリクエスト
+2.サーバは 402 Payment Required を返し、本文（またはヘッダ）に PaymentRequirements（scheme, network, maxAmountRequired, asset, payTo, resource, nonce, validUntil など）を含める
+3.クライアントはウォレットで支払いペイロードを作成し、同じリクエストを X-PAYMENT ヘッダ付きで再送
+4.サーバは Facilitator に verify →（OKなら）settle を呼び、成功時に200 OK + X-PAYMENT-RESPONSE で本体を返す
+（失敗時は再び402）
+
+3.2 価格とトークン
+-価格指定はPrice String（例：「$0.01」＝USDC）またはTokenAmount（原子単位）。将来カスタムEIP-3009トークンへ拡張可。
+
+3.3 ネットワーク
+-Base Sepoliaで検証 → Base Mainnetへ昇格
+-x402はネットワーク非依存の設計だが、Facilitatorごとに対応網が異なる（CDPはBase/Septolia、他のfacilitatorも有）
+
+##サーバ（packages/x402-mw）詳細
+4.1 ミドルウェアの役割
+-Price/Policy：ルートごとの価格・通貨（デフォルトUSDC）・ネットワーク（Base）・受取アドレス
+-402応答：PaymentRequirements を生成（resource はURL・HTTPメソッドを含めバインド）
+-検証：X-PAYMENT をパース → Facilitatorの verify／settle を呼ぶ（最初はCDP）
+-リプレイ防止：nonce をRedisに保存しワンタイムに。期限切れは拒否。
+-レート制限：IP／payerアドレスごとのウィンドウ制限
+-監査ログ：Postgresに決済監査を保存（下表）
+
+4.2 エンドポイントと責務（例）
+-GET /api/premium（保護対象）
+ -1回目：402 + PaymentRequirements
+ -2回目：X-PAYMENT を受け取り verify→settle、OKなら200 + X-PAYMENT-RESPONSE（tx情報）
+-GET /healthz：ヘルスチェック
+-GET /billing/export.csv?from=&to=&currency=JPY：会計エクスポート
+
+4.3 データモデル（PostgreSQL・最小）
+-payments
+ -id, payer_address, pay_to, asset, amount_atomic, fiat_currency, fiat_rate, network, resource, http_method, tx_hash, status(verified|settled|failed), created_at
+-payment_nonces
+ -nonce, payer_address, resource, expires_at, used_at
+-rate_limits
+ -key（IP or addr）, window_start, count
+-refunds（任意・将来）
+ -payment_id, reason, tx_hash, status
+
+4.4 環境変数（例）
+MODE=facilitator        # self にすると自前検証へ切替
+X402_NETWORK=base-sepolia
+X402_ASSET=USDC
+RECEIVER_ADDRESS=0x...
+CDP_API_KEY=...
+DATABASE_URL=postgres://...
+REDIS_URL=...
+ALLOWED_ORIGINS=https://example.com
+
+##クライアント（apps/web）詳細（任意だが強い）
+-Next.js + Smart Wallet：ユーザー／エージェントがETH無しでも支払える体験を再現（Paymasterでガス肩代わりのチュートリアルあり）。
+-x402クライアント：402応答をパース→ウォレット署名でPaymentPayload生成→X-PAYMENT 付きで同一リクエストを再送。ヘッダ名と流れは公式どおり。
+-予算/許可ドメイン：エージェント暴走対策（1日上限／許可URL）
+
+
+##セキュリティ／運用の要点（MVPで必ず入れる）
+-nonce & 期限：リプレイ防止は必須（保存＆TTL、重複使用で拒否）。
+-リソースへのバインド：PaymentRequirements.resource に**URL（＋HTTPメソッド）**を含め、別リソースの流用を防止。
+-レート制限／WAF：IP・アドレス別のQPS制御、国別ブロックが必要ならALB/WAF側で。
+-監査ログ：支払者・受取先・金額・tx・リソース・応答コードを必ず記録。
+-エラー設計：verify／settle 失敗理由（例：insufficient_funds）をユーザー可視化。
+-会計：CSV列例（timestamp,payer,resource,amount_atomic,asset,fiat_currency,fiat_rate,tx_hash,network,status）
+-HTTPの原則：あえて401/403ではなく402を用いることの意味（支払い要求の標準表現）。
+
+##自前検証モード（将来の切替ポイント）
+-目的：Facilitator依存を減らし、細かい制御を可能に
+-方法：X-PAYMENT 内のEIP-3009署名（transferWithAuthorization）をviemで検証→チェーン送信
+-前提：EIP-3009準拠トークンのみ（USDC等）。ネットワーク差分の注意点あり。
+
+##デプロイ方針（段階）
+-開発〜検証：Docker Compose（api/web/postgres/redis）＋ Base Sepolia ＋ x402 Facilitator
+-本番（速攻）：Vercel/Workers + Neon/Upstash などPaaS
+-本番（堅牢）：AWS ECS Fargate + RDS(Postgres) + ElastiCache(Redis) + WAF/ALB
+Facilitator利用なら自前ノード不要。自前検証へ切替時のみRPC（CDP Node/Alchemy等）を用意。 
+
+##受け入れ基準（Doneの定義）
+-保護ルートで 402 → 支払い → 200 + X-PAYMENT-RESPONSE が安定して通る。
+-レート制限・リプレイ防止が効いている（nonce再利用・期限切れ・高頻度を拒否）。
+-監査ログがCSVに落ち、tx追跡が可能。
+-Base Sepolia→Base本番への切替がenv差替のみで完了。
+（オプション）Smart Wallet + Paymasterでガスレス体験のデモが動く。
+

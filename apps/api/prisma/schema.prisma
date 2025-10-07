@@ -1,0 +1,208 @@
+// x402 Payment Middleware - Database Schema
+// Generator and datasource configuration
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// Core Payment Tables
+// ============================================================================
+
+/// 決済記録テーブル
+model Payment {
+  id          String   @id @default(uuid()) @db.Uuid
+  txHash      String   @unique @map("tx_hash") @db.VarChar(66) // 0x + 64文字
+  fromAddress String   @map("from_address") @db.VarChar(42)   // 0x + 40文字
+  toAddress   String   @map("to_address") @db.VarChar(42)     // 0x + 40文字
+  
+  // 金額情報
+  amount       String  @db.VarChar(78)  // bigint文字列 (最大78桁)
+  currency     String  @db.VarChar(10)  // USDC, ETH, etc.
+  decimals     Int     @db.SmallInt     // 通貨の小数点桁数
+  
+  // リソース・nonce
+  resource     String  @db.VarChar(500) // 保護されたリソースのパス
+  nonce        String  @db.VarChar(32)  // 32文字のnonce
+  
+  // ネットワーク情報
+  networkName  String  @map("network_name") @db.VarChar(50)
+  chainId      Int     @map("chain_id")
+  blockNumber  BigInt? @map("block_number")
+  blockHash    String? @map("block_hash") @db.VarChar(66)
+  
+  // 状態管理
+  status       PaymentStatus @default(PENDING)
+  
+  // タイムスタンプ
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  settledAt    DateTime? @map("settled_at") @db.Timestamptz(3)
+
+  // メタデータ（JSON形式）
+  metadata     Json?    @db.JsonB
+  
+  // リレーション
+  auditLogs    AuditLog[]
+  
+  @@map("payments")
+  @@index([txHash], name: "idx_payments_tx_hash")
+  @@index([fromAddress], name: "idx_payments_from_address")
+  @@index([status], name: "idx_payments_status")
+  @@index([createdAt], name: "idx_payments_created_at")
+  @@index([networkName, chainId], name: "idx_payments_network")
+  @@index([resource], name: "idx_payments_resource")
+}
+
+/// 決済状態の列挙型
+enum PaymentStatus {
+  PENDING    // 処理中
+  VERIFIED   // 検証済み
+  SETTLED    // 決済完了
+  FAILED     // 失敗
+  EXPIRED    // 期限切れ
+  REFUNDED   // 返金済み
+  
+  @@map("payment_status")
+}
+
+// ============================================================================
+// Security Tables
+// ============================================================================
+
+/// nonce管理テーブル（リプレイ防止）
+model PaymentNonce {
+  id         String   @id @default(uuid()) @db.Uuid
+  value      String   @unique @db.VarChar(32) // 32文字のnonce
+  resource   String   @db.VarChar(500)        // 関連リソース
+  used       Boolean  @default(false)         // 使用済みフラグ
+  
+  // 有効期限
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  expiresAt  DateTime @map("expires_at") @db.Timestamptz(3)
+  usedAt     DateTime? @map("used_at") @db.Timestamptz(3)
+  
+  // 関連情報
+  ipAddress  String?  @map("ip_address") @db.Inet
+  userAgent  String?  @map("user_agent") @db.Text
+  
+  @@map("payment_nonces")
+  @@index([value], name: "idx_nonces_value")
+  @@index([expiresAt], name: "idx_nonces_expires_at")
+  @@index([resource], name: "idx_nonces_resource")
+  @@index([createdAt], name: "idx_nonces_created_at")
+}
+
+/// レート制限テーブル
+model RateLimit {
+  id           String   @id @default(uuid()) @db.Uuid
+  identifier   String   @db.VarChar(100)     // IP address or wallet address
+  identifierType RateLimitType               // IP or WALLET
+  
+  // カウント情報
+  requestCount Int      @default(0) @map("request_count")
+  windowStart  DateTime @map("window_start") @db.Timestamptz(3)
+  windowEnd    DateTime @map("window_end") @db.Timestamptz(3)
+  
+  // リソース別制限
+  resource     String?  @db.VarChar(500)
+  
+  // 状態
+  blocked      Boolean  @default(false)
+  blockedUntil DateTime? @map("blocked_until") @db.Timestamptz(3)
+  
+  // タイムスタンプ
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  
+  @@map("rate_limits")
+  @@unique([identifier, identifierType, resource], name: "unique_rate_limit")
+  @@index([identifier], name: "idx_rate_limits_identifier")
+  @@index([windowEnd], name: "idx_rate_limits_window_end")
+  @@index([blocked], name: "idx_rate_limits_blocked")
+}
+
+/// レート制限の識別子タイプ
+enum RateLimitType {
+  IP       // IPアドレス
+  WALLET   // ウォレットアドレス
+  
+  @@map("rate_limit_type")
+}
+
+// ============================================================================
+// Audit and Logging Tables
+// ============================================================================
+
+/// 監査ログテーブル
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  // イベント情報
+  eventType AuditEventType @map("event_type")
+  eventData Json     @map("event_data") @db.JsonB
+  
+  // 関連エンティティ
+  paymentId String?  @map("payment_id") @db.Uuid
+  payment   Payment? @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  
+  // リクエスト情報
+  ipAddress String?  @map("ip_address") @db.Inet
+  userAgent String?  @map("user_agent") @db.Text
+  
+  // 結果
+  success   Boolean  @default(true)
+  errorCode String?  @map("error_code") @db.VarChar(50)
+  errorMsg  String?  @map("error_message") @db.Text
+  
+  // タイムスタンプ
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  
+  @@map("audit_logs")
+  @@index([eventType], name: "idx_audit_logs_event_type")
+  @@index([paymentId], name: "idx_audit_logs_payment_id")
+  @@index([createdAt], name: "idx_audit_logs_created_at")
+  @@index([success], name: "idx_audit_logs_success")
+}
+
+// 監査イベントタイプ
+enum AuditEventType {
+  PAYMENT_REQUIRED   // 402応答生成
+  PAYMENT_RECEIVED   // 支払い情報受信
+  PAYMENT_VERIFIED   // 支払い検証
+  PAYMENT_SETTLED    // 決済完了
+  PAYMENT_FAILED     // 支払い失敗
+  NONCE_GENERATED    // nonce生成
+  NONCE_VALIDATED    // nonce検証
+  RATE_LIMIT_HIT     // レート制限到達
+  SECURITY_VIOLATION // セキュリティ違反
+  
+  @@map("audit_event_type")
+}
+
+// ============================================================================
+// Configuration Tables
+// ============================================================================
+
+/// システム設定テーブル
+model SystemConfig {
+  id          String   @id @default(uuid()) @db.Uuid
+  key         String   @unique @db.VarChar(100)
+  value       Json     @db.JsonB
+  description String?  @db.Text
+  
+  // バージョニング
+  version     Int      @default(1)
+  
+  // タイムスタンプ
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  
+  @@map("system_configs")
+  @@index([key], name: "idx_system_configs_key")
+}
